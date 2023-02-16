@@ -16,9 +16,8 @@ class Exp(MyExp):
         self.test_size = (416, 416)
         self.mosaic_prob = 0.5
         self.enable_mixup = False
-        self.max_epoch = 100
+        self.max_epoch = 450
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
-        #self.basic_lr_per_img = 0.001
 
         # Define yourself dataset path
         self.data_dir = "datasets/drone_vid"
@@ -27,6 +26,11 @@ class Exp(MyExp):
         self.test_ann = "instances_test.json"
 
         self.num_classes = 1
+        self.basic_lr_per_img = 0.01 / 24.0
+        self.data_num_workers = 2
+
+        self.print_interval = 20
+        self.eval_interval = 5
 
     def get_model(self, sublinear=False):
 

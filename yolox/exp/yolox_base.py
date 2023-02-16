@@ -67,7 +67,7 @@ class Exp(BaseExp):
 
         # --------------  training config --------------------- #
         # epoch number used for warmup
-        self.warmup_epochs = 5
+        self.warmup_epochs = 1
         # max training epoch
         self.max_epoch = 300
         # minimum learning rate during warmup
@@ -88,10 +88,10 @@ class Exp(BaseExp):
         self.momentum = 0.9
         # log period in iter, for example,
         # if set to 1, user could see log every iteration.
-        self.print_interval = 10
+        self.print_interval = 20
         # eval period in epoch, for example,
         # if set to 1, model will be evaluate after every epoch.
-        self.eval_interval = 10
+        self.eval_interval = 2
         # save history checkpoint or not.
         # If set to False, yolox will only save latest and best ckpt.
         self.save_history_ckpt = True
