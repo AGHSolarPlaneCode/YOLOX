@@ -25,8 +25,9 @@ from yolox.utils import (
     time_synchronized,
     xyxy2xywh,
 )
+from YOLOX.yolox.utils import prepare_image_numpy, tf_lite_inference, postprocess_numpy
 
-from yolox.utils.boxes import postprocess
+# from yolox.utils.boxes import postprocess
 
 import tensorflow as tf
 
@@ -134,7 +135,7 @@ class COCOEvaluator:
 
     def evaluate(
         self,
-        model,
+        interpreter,
         distributed=False,
         half=False,
         trt_file=None,
@@ -157,10 +158,10 @@ class COCOEvaluator:
             summary (sr): summary info of evaluation.
         """
         # TODO half to amp_test
-        tensor_type = torch.HalfTensor if half else torch.FloatTensor
-        model = model.eval()
-        if half:
-            model = model.half()
+        # tensor_type = torch.cuda.HalfTensor if half else torch.cuda.FloatTensor
+        # model = model.eval()
+        # if half:
+            # model = model.half()
         ids = []
         data_list = []
         output_data = defaultdict()
@@ -170,62 +171,77 @@ class COCOEvaluator:
         nms_time = 0
         n_samples = max(len(self.dataloader) - 1, 1)
 
-        if trt_file is not None:
-            from torch2trt import TRTModule
+        # if trt_file is not None:
+        #     from torch2trt import TRTModule
 
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
+        #     model_trt = TRTModule()
+        #     model_trt.load_state_dict(torch.load(trt_file))
 
-            x = torch.ones(1, 3, test_size[0], test_size[1])
-            model(x)
-            model = model_trt
+        #     x = torch.ones(1, 3, test_size[0], test_size[1]).cuda()
+        #     model(x)
+        #     model = model_trt
 
-        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
+        for cur_iter, (imgs, imgs_preproc, info_imgs, ids) in enumerate(
             progress_bar(self.dataloader)
         ):
-            with torch.no_grad():
-                imgs = imgs.type(tensor_type)
+            # with torch.no_grad():
+            # imgs = imgs.type(tensor_type)
 
-                # skip the last iters since batchsize might be not enough for batch inference
-                is_time_record = cur_iter < len(self.dataloader) - 1
-                if is_time_record:
-                    start = time.time()
+            # skip the last iters since batchsize might be not enough for batch inference
+            is_time_record = cur_iter < len(self.dataloader) - 1
+            if is_time_record:
+                start = time.time()
 
-                outputs = model(imgs)
-                if decoder is not None:
-                    outputs = decoder(outputs, dtype=outputs.type())
+            input_image, image = prepare_image_numpy(imgs)
+            # input_image = imgs_preproc[0]
+            # print(input_image)
+            input_details = interpreter.get_input_details()
+            # when using single image inference with a n-images-per-batch model, copy image n times
+            input_image = np.concatenate(
+                [input_image] * input_details[0]["shape"][0], axis=0
+            )
+            network_result = tf_lite_inference(interpreter, input_image)
 
-                if is_time_record:
-                    infer_end = time_synchronized()
-                    inference_time += infer_end - start
+            if is_time_record:
+                infer_end = time_synchronized()
+                inference_time += infer_end - start
 
-                outputs = postprocess(
-                    outputs, self.num_classes, self.confthre, self.nmsthre,
-                    filter_class_ids=[0]
-                )
-                if is_time_record:
-                    nms_end = time_synchronized()
-                    nms_time += nms_end - infer_end
+            outputs = postprocess_numpy(
+                network_result, self.num_classes, self.confthre, 
+                self.nmsthre, filter_class_ids=[0]
+            )
+            
+            # print(outputs)
+            
+            # if decoder is not None:
+            #     outputs = decoder(outputs, dtype=outputs.type())
 
-                data_list_elem, image_wise_data = self.convert_to_coco_format(
-                    outputs, info_imgs, ids, return_outputs=True
-                )
-                data_list.extend(data_list_elem)
-                output_data.update(image_wise_data)
+            # outputs = postprocess(
+            #     outputs, self.num_classes, self.confthre, self.nmsthre
+            # )
+            if is_time_record:
+                nms_end = time_synchronized()
+                nms_time += nms_end - infer_end
 
-        statistics = torch.FloatTensor([inference_time, nms_time, n_samples])
-        if distributed:
-            # different process/device might have different speed,
-            # to make sure the process will not be stuck, sync func is used here.
-            synchronize()
-            data_list = gather(data_list, dst=0)
-            output_data = gather(output_data, dst=0)
-            data_list = list(itertools.chain(*data_list))
-            output_data = dict(ChainMap(*output_data))
-            torch.distributed.reduce(statistics, dst=0)
+            data_list_elem, image_wise_data = self.convert_to_coco_format(
+                outputs, list(map(list, zip(info_imgs))), [ids], return_outputs=True
+            )
+            data_list.extend(data_list_elem)
+            output_data.update(image_wise_data)
+
+        statistics = np.array([inference_time, nms_time, n_samples], dtype=np.float32)
+        # if distributed:
+        #     # different process/device might have different speed,
+        #     # to make sure the process will not be stuck, sync func is used here.
+        #     synchronize()
+        #     data_list = gather(data_list, dst=0)
+        #     output_data = gather(output_data, dst=0)
+        #     data_list = list(itertools.chain(*data_list))
+        #     output_data = dict(ChainMap(*output_data))
+        #     torch.distributed.reduce(statistics, dst=0)
 
         eval_results = self.evaluate_prediction(data_list, statistics)
-        synchronize()
+        # synchronize()
 
         if return_outputs:
             return eval_results, output_data
@@ -242,7 +258,7 @@ class COCOEvaluator:
         ):
             if output is None:
                 continue
-            output = output.cpu()
+            # output = output.cpu()
 
             bboxes = output[:, 0:4]
 
@@ -258,10 +274,10 @@ class COCOEvaluator:
             image_wise_data.update(
                 {
                     int(img_id): {
-                        "bboxes": [box.numpy().tolist() for box in bboxes],
-                        "scores": [score.numpy().item() for score in scores],
+                        "bboxes": [box.tolist() for box in bboxes],
+                        "scores": [score.item() for score in scores],
                         "categories": [
-                            self.dataloader.dataset.class_ids[int(cls[ind])]
+                            self.dataloader.class_ids[int(cls[ind])]
                             for ind in range(bboxes.shape[0])
                         ],
                     }
@@ -271,12 +287,12 @@ class COCOEvaluator:
             bboxes = xyxy2xywh(bboxes)
 
             for ind in range(bboxes.shape[0]):
-                label = self.dataloader.dataset.class_ids[int(cls[ind])]
+                label = self.dataloader.class_ids[int(cls[ind])]
                 pred_data = {
                     "image_id": int(img_id),
                     "category_id": label,
-                    "bbox": bboxes[ind].numpy().tolist(),
-                    "score": scores[ind].numpy().item(),
+                    "bbox": bboxes[ind].tolist(),
+                    "score": scores[ind].item(),
                     "segmentation": [],
                 }  # COCO json format
                 data_list.append(pred_data)
@@ -296,11 +312,11 @@ class COCOEvaluator:
         inference_time = statistics[0].item()
         nms_time = statistics[1].item()
         n_samples = statistics[2].item()
-
+        batch_size = 1 # TODO
         a_infer_time = (
-            1000 * inference_time / (n_samples * self.dataloader.batch_size)
+            1000 * inference_time / (n_samples * batch_size)
         )
-        a_nms_time = 1000 * nms_time / (n_samples * self.dataloader.batch_size)
+        a_nms_time = 1000 * nms_time / (n_samples * batch_size)
 
         time_info = ", ".join(
             [
@@ -317,7 +333,7 @@ class COCOEvaluator:
         # Evaluate the Dt (detection) json comparing with the ground truth
         # print(data_dict[0])
         if len(data_dict) > 0:
-            cocoGt = self.dataloader.dataset.coco
+            cocoGt = self.dataloader.coco
             # TODO: since pycocotools can't process dict in py36, write data to json file.
             if self.testdev:
                 json.dump(data_dict, open("./yolox_testdev_2017.json", "w"))

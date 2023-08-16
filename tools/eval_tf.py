@@ -4,17 +4,18 @@
 
 import argparse
 import os
-import random
-import warnings
+# import random
+# import warnings
 
-import torch
-import torch.backends.cudnn as cudnn
+import tensorflow.lite as tflite
+# import torch
+# import torch.backends.cudnn as cudnn
 from loguru import logger
-from torch.nn.parallel import DistributedDataParallel as DDP
+# from torch.nn.parallel import DistributedDataParallel as DDP
 
 from yolox.core import launch
 from yolox.exp import get_exp
-from yolox.utils import (
+from YOLOX.yolox.utils import (
     configure_module,
     configure_nccl,
     fuse_model,
@@ -66,6 +67,12 @@ def make_parser():
     parser.add_argument(
         "-c", "--ckpt", default=None, type=str, help="ckpt for eval"
     )
+    parser.add_argument(
+        "--dataset-path", default=None, type=str, help="evaluation dataset path"
+    )
+    parser.add_argument(
+        "--ann-path", default=None, type=str, help="evaluation annotations path"
+    )
     parser.add_argument("--conf", default=None, type=float, help="test conf")
     parser.add_argument(
         "--nms", default=None, type=float, help="test nms threshold"
@@ -80,20 +87,6 @@ def make_parser():
         default=False,
         action="store_true",
         help="Adopting mix precision evaluating.",
-    )
-    parser.add_argument(
-        "--fuse",
-        dest="fuse",
-        default=False,
-        action="store_true",
-        help="Fuse conv and bn for testing.",
-    )
-    parser.add_argument(
-        "--trt",
-        dest="trt",
-        default=False,
-        action="store_true",
-        help="Using TensorRT model for testing.",
     )
     parser.add_argument(
         "--legacy",
@@ -126,24 +119,17 @@ def make_parser():
 
 
 @logger.catch
-def main(exp, args, num_gpu):
-    if args.seed is not None:
-        random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        cudnn.deterministic = True
-        warnings.warn(
-            "You have chosen to seed testing. This will turn on the CUDNN deterministic setting, "
-        )
-
+def main(
+    # exp,
+    args, num_gpu
+):
     is_distributed = num_gpu > 1
 
-    # set environment variables for distributed training
-    configure_nccl()
-    cudnn.benchmark = True
-
     rank = get_local_rank()
+    
+    output_dir = "YOLOX_outputs"
 
-    file_name = os.path.join(exp.output_dir, args.experiment_name)
+    file_name = os.path.join(output_dir, "test")
 
     if rank == 0:
         os.makedirs(file_name, exist_ok=True)
@@ -154,63 +140,50 @@ def main(exp, args, num_gpu):
     logger.info("Args: {}".format(args))
 
     if args.conf is not None:
-        exp.test_conf = args.conf
+        test_conf = args.conf
     if args.nms is not None:
-        exp.nmsthre = args.nms
+        nmsthre = args.nms
     if args.tsize is not None:
-        exp.test_size = (args.tsize, args.tsize)
+        test_size = (args.tsize, args.tsize)
+    data_dir = args.dataset_path if args.dataset_path is not None else "datasets/coco"
+    test_ann = args.ann_path if args.ann_path is not None else "coco_test.json"
 
-    model = exp.get_model()
-    logger.info(
-        "Model Summary: {}".format(get_model_info(model, exp.test_size))
-    )
-    logger.info("Model Structure:\n{}".format(str(model)))
-
-    evaluator = exp.get_evaluator(
-        args.batch_size, is_distributed, args.test, args.legacy
+    from yolox.data import COCODataset, ValTransform
+    dataset = COCODataset(
+            data_dir=data_dir,
+            json_file=test_ann,
+            name="images",
+            img_size=test_size,
+            preproc=ValTransform(legacy=args.legacy),
+        )
+    from YOLOX.yolox.evaluators.coco_evaluator_tf import COCOEvaluator
+    evaluator = COCOEvaluator(
+        dataset,
+        test_size,
+        test_conf,
+        nmsthre,
+        1,
     )
     evaluator.per_class_AP = True
     evaluator.per_class_AR = True
 
-    # torch.cuda.set_device(rank)
-    # model.cuda(rank)
-    model.eval()
-
-    if not args.speed and not args.trt:
+    if not args.speed:
         if args.ckpt is None:
-            ckpt_file = os.path.join(file_name, "best_ckpt.pth")
+            ckpt_file = "../models/tf_lite/fp16.tflite"
         else:
             ckpt_file = args.ckpt
-        logger.info("loading checkpoint from {}".format(ckpt_file))
-        loc = "cuda:{}".format(rank)
-        ckpt = torch.load(ckpt_file, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        interpreter = tflite.Interpreter(
+            model_path=ckpt_file, num_threads=2 #?
+        )
+        interpreter.allocate_tensors()
         logger.info("loaded checkpoint done.")
 
-    if is_distributed:
-        model = DDP(model, device_ids=[rank])
-
-    if args.fuse:
-        logger.info("\tFusing model...")
-        model = fuse_model(model)
-
-    if args.trt:
-        assert (
-            not args.fuse and not is_distributed and args.batch_size == 1
-        ), "TensorRT model is not support model fusing and distributed inferencing!"
-        trt_file = os.path.join(file_name, "model_trt.pth")
-        assert os.path.exists(
-            trt_file
-        ), "TensorRT model is not found!\n Run tools/trt.py first!"
-        model.head.decode_in_inference = False
-        decoder = model.head.decode_outputs
-    else:
-        trt_file = None
-        decoder = None
+    trt_file = None
+    decoder = None
 
     # start evaluate
     *_, summary = evaluator.evaluate(
-        model, is_distributed, args.fp16, trt_file, decoder, exp.test_size
+        interpreter, is_distributed, args.fp16, trt_file, decoder, test_size
     )
     logger.info("\n" + summary)
 
@@ -218,24 +191,22 @@ def main(exp, args, num_gpu):
 if __name__ == "__main__":
     configure_module()
     args = make_parser().parse_args()
-    exp = get_exp(args.exp_file, args.name)
-    exp.merge(args.opts)
 
-    if not args.experiment_name:
-        args.experiment_name = exp.exp_name
-
-    # num_gpu = (
-    #     torch.cuda.device_count() if args.devices is None else args.devices
-    # )
+    num_gpu = (
+        0 if args.devices is None else args.devices
+    )
     # assert num_gpu <= torch.cuda.device_count()
 
     dist_url = "auto" if args.dist_url is None else args.dist_url
     launch(
         main,
-        0,
+        num_gpu,
         args.num_machines,
         args.machine_rank,
         backend=args.dist_backend,
         dist_url=dist_url,
-        args=(exp, args, 0),
+        args=(
+            # exp, 
+            args, num_gpu
+        ),
     )
